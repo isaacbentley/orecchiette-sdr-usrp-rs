@@ -255,10 +255,8 @@ impl SdrSource for UsrpSource {
                             }
                         }
 
-                        if put_back {
-                            if let Some(buf) = raw_buffer {
-                                let _ = pool_tx.send(buf);
-                            }
+                        if put_back && let Some(buf) = raw_buffer {
+                            let _ = pool_tx.send(buf);
                         }
 
                         let elapsed = now_loop.duration_since(last_report);

@@ -1,0 +1,39 @@
+# cargo-deny configuration. CI runs `cargo deny check` (advisories,
+# licenses, bans, sources) — see `.github/workflows/ci.yml`'s `deny` job.
+
+[advisories]
+version = 2
+yanked = "deny"
+# All three are build-dependencies of `bindgen v0.55.1`, pinned
+# transitively by `uhd-sys v0.1.3` (the `uhd` crate's FFI bindings
+# generator for Ettus UHD). None of the three are compiled into the
+# published `orecchiette-sdr-usrp-rs` artifact — they only run
+# `build.rs` during compilation. No fix is available without an
+# upstream `uhd`/`uhd-sys` release bumping bindgen; revisit if/when
+# that happens.
+ignore = [
+    "RUSTSEC-2024-0006", # shlex: unescaped quote-API characters (bindgen build-dep)
+    "RUSTSEC-2021-0139", # ansi_term: unmaintained (via clap 2.x, bindgen build-dep)
+    "RUSTSEC-2024-0375", # atty: unmaintained (via clap 2.x / env_logger, bindgen build-dep)
+]
+
+[licenses]
+version = 2
+# The crate itself is GPL-3.0-or-later.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "GPL-3.0-or-later",
+    "CC0-1.0",
+    "MPL-2.0",
+    "Zlib",
+]
+
+[sources]
+# No git dependencies in this crate.
+unknown-git = "deny"
