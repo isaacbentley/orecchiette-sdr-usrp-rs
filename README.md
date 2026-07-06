@@ -1,16 +1,23 @@
-# 📡 orecchiette-sdr-usrp-rs: Ettus USRP Interface
+# orecchiette-sdr-usrp-rs
 
 [![CI](https://github.com/isaacbentley/orecchiette-sdr-usrp-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/isaacbentley/orecchiette-sdr-usrp-rs/actions/workflows/ci.yml)
-[![MSRV](https://img.shields.io/badge/rustc-1.85+-ab6000.svg)](https://blog.rust-lang.org/2025/02/20/Rust-1.85.0.html)
+[![License: GPL-3.0-or-later](https://img.shields.io/github/license/isaacbentley/orecchiette-sdr-usrp-rs.svg)](https://choosealicense.com/licenses/gpl-3.0/)
 
-## 🎯 **What it does**
+Ettus USRP B2xx implementation of the [`SdrSource`](https://github.com/isaacbentley/orecchiette-sdr-source-rs) trait. Tested on the B210; the B205mini works the same way (note: it only exposes `RX2`). Talks to the device through the `uhd` 0.3 crate over UHD 4.x.
 
-Ettus USRP B2xx implementation of the
-[`SdrSource`](https://github.com/isaacbentley/orecchiette-sdr-source-rs) trait. Tested on the B210;
-the B205mini works the same way (note: it only exposes `RX2`). Talks
-to the device through the `uhd` 0.3 crate over UHD 4.x.
+## Installation
 
-## 🔧 **Usage**
+Requires [UHD](https://files.ettus.com/manual/) installed on your system (e.g. `sudo apt install libuhd-dev uhd-host` on Ubuntu/Debian, or `brew install uhd` on macOS).
+
+Add the following to your `Cargo.toml`:
+
+```toml
+[dependencies]
+orecchiette-sdr-usrp-rs = "0.1.0"
+orecchiette-sdr-source-rs = "0.1.0"
+```
+
+## Usage
 
 ```rust,ignore
 use orecchiette_sdr_usrp_rs::UsrpSource;
@@ -50,7 +57,7 @@ for packet in handle.receiver.iter() {
 }
 ```
 
-## ⚙️ **Builder Fields**
+## Builder Fields
 
 | Field | Default | Notes |
 |---|---|---|
@@ -58,25 +65,19 @@ for packet in handle.receiver.iter() {
 | `gain_db` | `40.0` | B210 supports 0–76 dB. 40 dB is a mid value that doesn't saturate on strong ambient ISM traffic. |
 | `antenna` | `"RX2"` | B210 has `RX1` / `RX2`; B205mini has `RX2` only. |
 
-## 📦 **Dependencies**
+## MSRV & Semver Policy
 
-```toml
-orecchiette-sdr-source-rs = { git = "https://github.com/isaacbentley/orecchiette-sdr-source-rs.git", branch = "main" }
-uhd           = "0.3"
-crossbeam     = "0.8"
-num-complex   = "0.4"
-anyhow        = "1.0"
-tracing       = "0.1"
-```
+- **MSRV:** This crate does not maintain an explicit Minimum Supported Rust Version (MSRV) policy and tracks the latest `stable` compiler.
+- **Semver:** This crate follows semantic versioning. While in `0.x.y`, breaking API changes will result in a minor version bump (e.g. `0.1.x` to `0.2.0`).
 
-## 📚 **Documentation**
+## Testing & Contributing
+
+Please see [CONTRIBUTING.md](CONTRIBUTING.md) for detailed instructions on running the test suite and formatting your code before submitting a Pull Request.
+
+## Documentation
 
 - [Architecture & Design](DESIGN.md) — internal architecture and execution flow.
 
-## 📄 **License**
+## License
 
-This project is licensed under the GNU General Public License v3.0 or later (GPL-3.0-or-later) - see the [LICENSE](../../LICENSE) file for details.
-
-## 📞 **Support**
-
-- 🐛 **Issues**: [GitHub Issues](https://github.com/isaacbentley/orecchiette-sdr-usrp-rs/issues)
+This project is licensed under the GNU General Public License v3.0 or later (GPL-3.0-or-later) - see the [LICENSE](LICENSE) file for details.
