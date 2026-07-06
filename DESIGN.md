@@ -1,6 +1,6 @@
-# Design: Ettus USRP Interface (sdr-usrp-rs)
+# Design: Ettus USRP Interface (orecchiette-sdr-usrp-rs)
 
-This document outlines the architecture of the `sdr-usrp-rs` crate, providing integration with Ettus Research USRP devices (primarily the B210 and B205mini) via the `uhd` Rust bindings.
+This document outlines the architecture of the `orecchiette-sdr-usrp-rs` crate, providing integration with Ettus Research USRP devices (primarily the B210 and B205mini) via the `uhd` Rust bindings.
 
 ## 1. Introduction
 

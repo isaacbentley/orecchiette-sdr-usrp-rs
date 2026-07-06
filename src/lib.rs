@@ -1,7 +1,7 @@
 #![doc = include_str!("../README.md")]
 //! USRP-family SDR source for SDR applications.
 //!
-//! Implements [`sdr_source_rs::SdrSource`] for Ettus USRP devices
+//! Implements [`orecchiette_sdr_source_rs::SdrSource`] for Ettus USRP devices
 //! (tested on B210; B205mini should also work). Owns the device
 //! handle, the channel-hop loop, and the IQ buffer allocation. The
 //! orchestrator consumes [`IqPacket`]s through the receiver returned
@@ -9,7 +9,7 @@
 
 use crossbeam::channel;
 use num_complex::Complex32;
-use sdr_source_rs::{
+use orecchiette_sdr_source_rs::{
     DwellAdvice, DwellController, IqPacket, SdrError, SdrHandle, SdrSource, SourceConfig,
     freq_key_khz,
 };
@@ -209,8 +209,8 @@ impl SdrSource for UsrpSource {
                             // SAFETY: We pre-initialized the vector capacity
                             // via `vec![Complex32::new(0.0, 0.0); 65536]`. Thus,
                             // `.set_len(65536)` exposes fully initialized (though
-                            // stale) elements, which is perfectly sound. 
-                            // WARNING: Do not swap the allocation to `Vec::with_capacity` 
+                            // stale) elements, which is perfectly sound.
+                            // WARNING: Do not swap the allocation to `Vec::with_capacity`
                             // or this will trigger UB.
                             #[allow(clippy::uninit_vec)]
                             unsafe {
@@ -234,7 +234,7 @@ impl SdrSource for UsrpSource {
                                 buf.truncate(n);
 
                                 let pkt = IqPacket {
-                                    samples: sdr_source_rs::PooledIqBuffer::new_pooled(
+                                    samples: orecchiette_sdr_source_rs::PooledIqBuffer::new_pooled(
                                         buf,
                                         pool_tx.clone(),
                                     ),
@@ -263,8 +263,7 @@ impl SdrSource for UsrpSource {
 
                         let elapsed = now_loop.duration_since(last_report);
                         if elapsed >= Duration::from_secs(60) {
-                            let rate =
-                                channel_switches as f32 / elapsed.as_secs_f32();
+                            let rate = channel_switches as f32 / elapsed.as_secs_f32();
                             info!(
                                 "[usrp] Scanning speed: {:.1} ch/s | Pool size: {} channels",
                                 rate, num_channels

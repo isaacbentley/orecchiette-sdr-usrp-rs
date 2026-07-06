@@ -1,20 +1,20 @@
-# 📡 sdr-usrp-rs: Ettus USRP Interface
+# 📡 orecchiette-sdr-usrp-rs: Ettus USRP Interface
 
-[![CI](https://github.com/isaacbentley/sdr-usrp-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/isaacbentley/sdr-usrp-rs/actions/workflows/ci.yml)
+[![CI](https://github.com/isaacbentley/orecchiette-sdr-usrp-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/isaacbentley/orecchiette-sdr-usrp-rs/actions/workflows/ci.yml)
 [![MSRV](https://img.shields.io/badge/rustc-1.85+-ab6000.svg)](https://blog.rust-lang.org/2025/02/20/Rust-1.85.0.html)
 
 ## 🎯 **What it does**
 
 Ettus USRP B2xx implementation of the
-[`SdrSource`](https://github.com/isaacbentley/sdr-source-rs) trait. Tested on the B210;
+[`SdrSource`](https://github.com/isaacbentley/orecchiette-sdr-source-rs) trait. Tested on the B210;
 the B205mini works the same way (note: it only exposes `RX2`). Talks
 to the device through the `uhd` 0.3 crate over UHD 4.x.
 
 ## 🔧 **Usage**
 
 ```rust,ignore
-use sdr_usrp_rs::UsrpSource;
-use sdr_source_rs::{DwellAdvice, SdrSource, SourceConfig};
+use orecchiette_sdr_usrp_rs::UsrpSource;
+use orecchiette_sdr_source_rs::{DwellAdvice, SdrSource, SourceConfig};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -61,7 +61,7 @@ for packet in handle.receiver.iter() {
 ## 📦 **Dependencies**
 
 ```toml
-sdr-source-rs = { git = "https://github.com/isaacbentley/sdr-source-rs.git", branch = "main" }
+orecchiette-sdr-source-rs = { git = "https://github.com/isaacbentley/orecchiette-sdr-source-rs.git", branch = "main" }
 uhd           = "0.3"
 crossbeam     = "0.8"
 num-complex   = "0.4"
@@ -79,4 +79,4 @@ This project is licensed under the GNU General Public License v3.0 or later (GPL
 
 ## 📞 **Support**
 
-- 🐛 **Issues**: [GitHub Issues](https://github.com/isaacbentley/sdr-usrp-rs/issues)
+- 🐛 **Issues**: [GitHub Issues](https://github.com/isaacbentley/orecchiette-sdr-usrp-rs/issues)
