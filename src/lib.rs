@@ -117,6 +117,9 @@ impl SdrSource for UsrpSource {
                 "SourceConfig.channels_hz must not be empty".into(),
             ));
         }
+        if sample_rate <= 0.0 {
+            return Err(SdrError::BadConfig("SourceConfig.sample_rate_hz must be > 0".into()));
+        }
         if dwell_controller.is_adaptive() {
             info!(
                 "[usrp] Starting scan: {} channels, adaptive dwell {}–{}ms (+{}ms per detection)",
@@ -140,149 +143,191 @@ impl SdrSource for UsrpSource {
         let sample_rate_f32 = sample_rate as f32;
 
         let capture_thread = thread::spawn(move || {
-            if let Err(e) = (move || -> Result<(), anyhow::Error> {
-                // uhd 0.3.0's `Usrp::get_rx_stream` and `Usrp::set_rx_frequency` both take
-                // `&mut self`, and `ReceiveStreamer<'_>` holds the mutable borrow for its
-                // lifetime. We therefore have to recreate the streamer per hop. Eliminating
-                // that overhead requires either upgrading/forking the uhd binding or dropping
-                // to uhd-sys and managing the C handle ourselves. For now we lift everything
-                // that *can* live outside the loop and accept the per-hop streamer teardown.
-                let stream_args = uhd::StreamArgs::builder()
-                    .wire_format("sc16".to_string())
-                    .args("num_recv_frames=1024".to_string())
-                    .build();
+            let panic_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                if let Err(e) = (move || -> Result<(), anyhow::Error> {
+                    // uhd 0.3.0's `Usrp::get_rx_stream` and `Usrp::set_rx_frequency` both take
+                    // `&mut self`, and `ReceiveStreamer<'_>` holds the mutable borrow for its
+                    // lifetime. We therefore have to recreate the streamer per hop. Eliminating
+                    // that overhead requires either upgrading/forking the uhd binding or dropping
+                    // to uhd-sys and managing the C handle ourselves. For now we lift everything
+                    // that *can* live outside the loop and accept the per-hop streamer teardown.
+                    let stream_args = uhd::StreamArgs::builder()
+                        .wire_format("sc16".to_string())
+                        .args("num_recv_frames=1024".to_string())
+                        .build();
 
-                // Pre-allocate the vector recycling pool
-                let (pool_tx, pool_rx) = channel::bounded::<Vec<Complex32>>(256);
-                for _ in 0..256 {
-                    let _ = pool_tx.send(vec![Complex32::new(0.0, 0.0); 65536]);
-                }
-
-                let mut last_report = Instant::now();
-                let mut channel_switches = 0;
-                let mut channel_idx = 0;
-
-                'outer: loop {
-                    if stop_flag_thread.load(Ordering::SeqCst) {
-                        break;
+                    // Pre-allocate the vector recycling pool
+                    let (pool_tx, pool_rx) = channel::bounded::<Vec<Complex32>>(1024);
+                    for _ in 0..1024 {
+                        let _ = pool_tx.send(vec![Complex32::new(0.0, 0.0); 65536]);
                     }
-                    let current_freq_hz = channels_hz[channel_idx];
-                    let freq_key = freq_key_khz(current_freq_hz);
-                    usrp.set_rx_frequency(&TuneRequest::with_frequency(current_freq_hz), 0)?;
 
-                    let mut rx_stream = usrp.get_rx_stream(&stream_args)?;
-                    rx_stream.send_command(&StreamCommand {
-                        command_type: StreamCommandType::StartContinuous,
-                        time: StreamTime::Now,
-                    })?;
+                    let mut last_report = Instant::now();
+                    let mut channel_switches = 0;
+                    let mut channel_idx = 0;
+                    let mut consecutive_failures = 0;
+                    let num_channels = channels_hz.len();
 
-                    let dwell_start = Instant::now();
-                    loop {
+                    'outer: loop {
                         if stop_flag_thread.load(Ordering::SeqCst) {
-                            rx_stream.send_command(&StreamCommand {
-                                command_type: StreamCommandType::StopContinuous,
-                                time: StreamTime::Now,
-                            })?;
-                            drop(rx_stream);
-                            break 'outer;
-                        }
-                        let now_loop = Instant::now();
-                        let latest_signal = advice_thread.latest_signal_at(freq_key);
-                        let deadline = dwell_controller.deadline(dwell_start, latest_signal);
-                        if now_loop >= deadline {
                             break;
                         }
 
-                        // Borrow an empty buffer from the pool (or allocate if heavily backed up)
-                        let mut raw_buffer = Some(
-                            pool_rx
-                                .try_recv()
-                                .unwrap_or_else(|_| vec![Complex32::new(0.0, 0.0); 65536]),
-                        );
-                        {
-                            // Present a full-length 65536-element buffer to
-                            // `receive` without paying for a 512 KB zero-fill
-                            // every iteration: UHD overwrites `[0..n]` and we
-                            // discard the tail, so the memset was pure waste.
-                            let buf = raw_buffer.as_mut().unwrap();
-                            buf.reserve(65536_usize.saturating_sub(buf.len()));
-                            // SAFETY: We pre-initialized the vector capacity
-                            // via `vec![Complex32::new(0.0, 0.0); 65536]`. Thus,
-                            // `.set_len(65536)` exposes fully initialized (though
-                            // stale) elements, which is perfectly sound.
-                            // WARNING: Do not swap the allocation to `Vec::with_capacity`
-                            // or this will trigger UB.
-                            #[allow(clippy::uninit_vec)]
-                            unsafe {
-                                buf.set_len(65536);
+                        if consecutive_failures >= num_channels {
+                            tracing::warn!("[usrp] All channels failed to tune consecutively. Sleeping for 500ms before retrying.");
+                            thread::sleep(Duration::from_millis(500));
+                            consecutive_failures = 0;
+                        }
+
+                        let current_freq_hz = channels_hz[channel_idx];
+                        let freq_key = freq_key_khz(current_freq_hz);
+
+                        if let Err(e) = usrp.set_rx_frequency(&TuneRequest::with_frequency(current_freq_hz), 0) {
+                            tracing::warn!("[usrp] Failed to set frequency to {} Hz: {:?}. Skipping channel.", current_freq_hz, e);
+                            consecutive_failures += 1;
+                            channel_idx = (channel_idx + 1) % num_channels;
+                            continue;
+                        }
+
+                        let mut rx_stream = match usrp.get_rx_stream(&stream_args) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::warn!("[usrp] Failed to get RX stream for {} Hz: {:?}. Skipping channel.", current_freq_hz, e);
+                                consecutive_failures += 1;
+                                channel_idx = (channel_idx + 1) % num_channels;
+                                continue;
                             }
+                        };
+
+                        if let Err(e) = rx_stream.send_command(&StreamCommand {
+                            command_type: StreamCommandType::StartContinuous,
+                            time: StreamTime::Now,
+                        }) {
+                            tracing::warn!("[usrp] Failed to send start command for {} Hz: {:?}. Skipping channel.", current_freq_hz, e);
+                            consecutive_failures += 1;
+                            channel_idx = (channel_idx + 1) % num_channels;
+                            continue;
                         }
 
-                        let mut put_back = true;
-                        let mut buffers = [&mut raw_buffer.as_mut().unwrap()[..]];
-                        if let Ok(meta) = rx_stream.receive(&mut buffers, 0.05, false) {
-                            let n = meta.samples().min(raw_buffer.as_ref().unwrap().len());
-                            if n > 0 {
-                                let is_overrun = if let Some(err) = meta.last_error() {
-                                    err.to_string().contains("Overflow")
-                                } else {
-                                    false
-                                };
+                        // Reset consecutive failures on successful tune/start
+                        consecutive_failures = 0;
 
-                                let mut buf = raw_buffer.take().unwrap();
-                                // Truncate the vector to exactly n samples (capacity is maintained)
-                                buf.truncate(n);
-
-                                let pkt = IqPacket {
-                                    samples: orecchiette_sdr_source_rs::PooledIqBuffer::new_pooled(
-                                        buf,
-                                        pool_tx.clone(),
-                                    ),
-                                    center_frequency_hz: current_freq_hz,
-                                    sample_rate_hz: sample_rate_f32,
-                                    overrun: is_overrun,
-                                };
-                                if tx.send(pkt).is_err() {
-                                    // Receiver dropped — wind down.
-                                    rx_stream.send_command(&StreamCommand {
-                                        command_type: StreamCommandType::StopContinuous,
-                                        time: StreamTime::Now,
-                                    })?;
-                                    drop(rx_stream);
-                                    break 'outer;
-                                }
-                                put_back = false;
+                        let dwell_start = Instant::now();
+                        loop {
+                            if stop_flag_thread.load(Ordering::SeqCst) {
+                                let _ = rx_stream.send_command(&StreamCommand {
+                                    command_type: StreamCommandType::StopContinuous,
+                                    time: StreamTime::Now,
+                                });
+                                drop(rx_stream);
+                                break 'outer;
                             }
-                        }
+                            let now_loop = Instant::now();
+                            let latest_signal = advice_thread.latest_signal_at(freq_key);
+                            let deadline = dwell_controller.deadline(dwell_start, latest_signal);
+                            if now_loop >= deadline {
+                                break;
+                            }
 
-                        if put_back && let Some(buf) = raw_buffer {
-                            let _ = pool_tx.send(buf);
-                        }
-
-                        let elapsed = now_loop.duration_since(last_report);
-                        if elapsed >= Duration::from_secs(60) {
-                            let rate = channel_switches as f32 / elapsed.as_secs_f32();
-                            info!(
-                                "[usrp] Scanning speed: {:.1} ch/s | Pool size: {} channels",
-                                rate, num_channels
+                            // Borrow an empty buffer from the pool (or allocate if heavily backed up)
+                            let mut raw_buffer = Some(
+                                pool_rx
+                                    .try_recv()
+                                    .unwrap_or_else(|_| vec![Complex32::new(0.0, 0.0); 65536]),
                             );
-                            channel_switches = 0;
-                            last_report = now_loop;
+                            {
+                                // Present a full-length 65536-element buffer to
+                                // `receive` without paying for a 512 KB zero-fill
+                                // every iteration: UHD overwrites `[0..n]` and we
+                                // discard the tail, so the memset was pure waste.
+                                let buf = raw_buffer.as_mut().unwrap();
+                                buf.reserve(65536_usize.saturating_sub(buf.len()));
+                                // SAFETY: We pre-initialized the vector capacity
+                                // via `vec![Complex32::new(0.0, 0.0); 65536]`. Thus,
+                                // `.set_len(65536)` exposes fully initialized (though
+                                // stale) elements, which is perfectly sound.
+                                // WARNING: Do not swap the allocation to `Vec::with_capacity`
+                                // or this will trigger UB.
+                                #[allow(clippy::uninit_vec)]
+                                unsafe {
+                                    buf.set_len(65536);
+                                }
+                            }
+
+                            let mut put_back = true;
+                            let mut buffers = [&mut raw_buffer.as_mut().unwrap()[..]];
+                            match rx_stream.receive(&mut buffers, 0.05, false) {
+                                Ok(meta) => {
+                                    let n = meta.samples().min(raw_buffer.as_ref().unwrap().len());
+                                    if n > 0 {
+                                        let is_overrun = if let Some(err) = meta.last_error() {
+                                            err.to_string().contains("Overflow")
+                                        } else {
+                                            false
+                                        };
+
+                                        let mut buf = raw_buffer.take().unwrap();
+                                        // Truncate the vector to exactly n samples (capacity is maintained)
+                                        buf.truncate(n);
+
+                                        let pkt = IqPacket {
+                                            samples: orecchiette_sdr_source_rs::PooledIqBuffer::new_pooled(
+                                                buf,
+                                                pool_tx.clone(),
+                                            ),
+                                            center_frequency_hz: current_freq_hz,
+                                            sample_rate_hz: sample_rate_f32,
+                                            overrun: is_overrun,
+                                        };
+                                        if tx.send(pkt).is_err() {
+                                            // Receiver dropped — wind down.
+                                            let _ = rx_stream.send_command(&StreamCommand {
+                                                command_type: StreamCommandType::StopContinuous,
+                                                time: StreamTime::Now,
+                                            });
+                                            drop(rx_stream);
+                                            break 'outer;
+                                        }
+                                        put_back = false;
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!("[usrp] Receive error on frequency {} Hz: {:?}", current_freq_hz, e);
+                                }
+                            }
+
+                            if put_back && let Some(buf) = raw_buffer {
+                                let _ = pool_tx.send(buf);
+                            }
+
+                            let elapsed = now_loop.duration_since(last_report);
+                            if elapsed >= Duration::from_secs(60) {
+                                let rate = channel_switches as f32 / elapsed.as_secs_f32();
+                                info!(
+                                    "[usrp] Scanning speed: {:.1} ch/s | Pool size: {} channels",
+                                    rate, num_channels
+                                );
+                                channel_switches = 0;
+                                last_report = now_loop;
+                            }
                         }
+
+                        let _ = rx_stream.send_command(&StreamCommand {
+                            command_type: StreamCommandType::StopContinuous,
+                            time: StreamTime::Now,
+                        });
+                        drop(rx_stream);
+
+                        channel_idx = (channel_idx + 1) % num_channels;
+                        channel_switches += 1;
                     }
-
-                    rx_stream.send_command(&StreamCommand {
-                        command_type: StreamCommandType::StopContinuous,
-                        time: StreamTime::Now,
-                    })?;
-                    drop(rx_stream);
-
-                    channel_idx = (channel_idx + 1) % num_channels;
-                    channel_switches += 1;
+                    Ok(())
+                })() {
+                    tracing::error!("[usrp] Capture thread failed: {:?}", e);
                 }
-                Ok(())
-            })() {
-                tracing::error!("[usrp] Capture thread failed: {:?}", e);
+            }));
+            if let Err(e) = panic_res {
+                tracing::error!("[usrp] Capture thread panicked: {:?}", e);
             }
         });
 
