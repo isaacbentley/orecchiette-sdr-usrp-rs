@@ -20,6 +20,13 @@ use std::time::{Duration, Instant};
 use tracing::info;
 use uhd::{StreamCommand, StreamCommandType, StreamTime, TuneRequest};
 
+/// After this many consecutive full sweeps where every channel fails
+/// to tune/stream (each sweep followed by a 500ms backoff sleep), give
+/// up on the device rather than retrying forever — a USRP that's been
+/// unplugged or wedged should surface as a terminal error instead of
+/// spinning silently.
+const MAX_CONSECUTIVE_SWEEP_FAILURES: u32 = 10;
+
 /// Builder for a USRP source. Wrap in `Box::new(...)` and call
 /// [`SdrSource::start`] from the orchestrator.
 pub struct UsrpSource {
@@ -45,6 +52,39 @@ impl Default for UsrpSource {
     }
 }
 
+/// Reject an empty channel list or non-positive sample rate before any
+/// hardware is touched. Kept as a standalone function so `start()` can
+/// fail fast — and so this can be unit-tested — ahead of the
+/// `uhd::Usrp::find`/`open`/`set_rx_sample_rate` calls it used to run
+/// after.
+fn validate_source_config(num_channels: usize, sample_rate: f64) -> Result<(), SdrError> {
+    if num_channels == 0 {
+        return Err(SdrError::BadConfig(
+            "SourceConfig.channels_hz must not be empty".into(),
+        ));
+    }
+    if sample_rate <= 0.0 {
+        return Err(SdrError::BadConfig(
+            "SourceConfig.sample_rate_hz must be > 0".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Optimal master clock selection: highest integer decimation (up to
+/// 4×) within the 61.44 MHz limit. Each 4× oversampling step yields
+/// ~1 additional bit of ENOB at the cost of more FPGA work, which the
+/// B210 can deliver up to its ceiling.
+fn select_master_clock(sample_rate: f64) -> (f64, u32) {
+    if sample_rate * 4.0 <= 61.44e6 {
+        (sample_rate * 4.0, 4)
+    } else if sample_rate * 2.0 <= 61.44e6 {
+        (sample_rate * 2.0, 2)
+    } else {
+        (sample_rate, 1)
+    }
+}
+
 impl SdrSource for UsrpSource {
     fn start(
         self: Box<Self>,
@@ -52,18 +92,11 @@ impl SdrSource for UsrpSource {
         advice: Arc<dyn DwellAdvice>,
     ) -> Result<SdrHandle, SdrError> {
         let sample_rate = config.sample_rate_hz;
+        let channels_hz = config.channels_hz.clone();
+        let num_channels = channels_hz.len();
+        validate_source_config(num_channels, sample_rate)?;
 
-        // Optimal Master Clock Selection: highest integer decimation
-        // (up to 4×) within the 61.44 MHz limit. Each 4× oversampling
-        // step yields ~1 additional bit of ENOB at the cost of more
-        // FPGA work, which the B210 can deliver up to its ceiling.
-        let (master_clock, decimation) = if sample_rate * 4.0 <= 61.44e6 {
-            (sample_rate * 4.0, 4)
-        } else if sample_rate * 2.0 <= 61.44e6 {
-            (sample_rate * 2.0, 2)
-        } else {
-            (sample_rate, 1)
-        };
+        let (master_clock, decimation) = select_master_clock(sample_rate);
 
         let bit_gain = (decimation as f32).log2() * 0.5;
         let total_bits = 12.0 + bit_gain;
@@ -110,16 +143,6 @@ impl SdrSource for UsrpSource {
             extension: config.dwell_extension,
         };
 
-        let channels_hz = config.channels_hz.clone();
-        let num_channels = channels_hz.len();
-        if num_channels == 0 {
-            return Err(SdrError::BadConfig(
-                "SourceConfig.channels_hz must not be empty".into(),
-            ));
-        }
-        if sample_rate <= 0.0 {
-            return Err(SdrError::BadConfig("SourceConfig.sample_rate_hz must be > 0".into()));
-        }
         if dwell_controller.is_adaptive() {
             info!(
                 "[usrp] Starting scan: {} channels, adaptive dwell {}–{}ms (+{}ms per detection)",
@@ -144,7 +167,7 @@ impl SdrSource for UsrpSource {
 
         let capture_thread = thread::spawn(move || {
             let panic_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                if let Err(e) = (move || -> Result<(), anyhow::Error> {
+                let hop_result: Result<(), anyhow::Error> = {
                     // uhd 0.3.0's `Usrp::get_rx_stream` and `Usrp::set_rx_frequency` both take
                     // `&mut self`, and `ReceiveStreamer<'_>` holds the mutable borrow for its
                     // lifetime. We therefore have to recreate the streamer per hop. Eliminating
@@ -166,6 +189,7 @@ impl SdrSource for UsrpSource {
                     let mut channel_switches = 0;
                     let mut channel_idx = 0;
                     let mut consecutive_failures = 0;
+                    let mut consecutive_sweep_failures = 0;
                     let num_channels = channels_hz.len();
 
                     'outer: loop {
@@ -174,6 +198,14 @@ impl SdrSource for UsrpSource {
                         }
 
                         if consecutive_failures >= num_channels {
+                            consecutive_sweep_failures += 1;
+                            if consecutive_sweep_failures >= MAX_CONSECUTIVE_SWEEP_FAILURES {
+                                tracing::error!(
+                                    "[usrp] All channels failed to tune for {} consecutive sweeps. Giving up — is the USRP still connected?",
+                                    consecutive_sweep_failures
+                                );
+                                break 'outer;
+                            }
                             tracing::warn!("[usrp] All channels failed to tune consecutively. Sleeping for 500ms before retrying.");
                             thread::sleep(Duration::from_millis(500));
                             consecutive_failures = 0;
@@ -211,6 +243,7 @@ impl SdrSource for UsrpSource {
 
                         // Reset consecutive failures on successful tune/start
                         consecutive_failures = 0;
+                        consecutive_sweep_failures = 0;
 
                         let dwell_start = Instant::now();
                         loop {
@@ -237,21 +270,15 @@ impl SdrSource for UsrpSource {
                             );
                             {
                                 // Present a full-length 65536-element buffer to
-                                // `receive` without paying for a 512 KB zero-fill
-                                // every iteration: UHD overwrites `[0..n]` and we
-                                // discard the tail, so the memset was pure waste.
+                                // `receive`. Buffers recycled through
+                                // `PooledIqBuffer::drop` come back at len 0 (but
+                                // capacity 65536), so this resize both restores
+                                // the length UHD expects and re-zeroes memory
+                                // that `clear()` had logically invalidated — no
+                                // reallocation occurs since capacity already
+                                // covers it.
                                 let buf = raw_buffer.as_mut().unwrap();
-                                buf.reserve(65536_usize.saturating_sub(buf.len()));
-                                // SAFETY: We pre-initialized the vector capacity
-                                // via `vec![Complex32::new(0.0, 0.0); 65536]`. Thus,
-                                // `.set_len(65536)` exposes fully initialized (though
-                                // stale) elements, which is perfectly sound.
-                                // WARNING: Do not swap the allocation to `Vec::with_capacity`
-                                // or this will trigger UB.
-                                #[allow(clippy::uninit_vec)]
-                                unsafe {
-                                    buf.set_len(65536);
-                                }
+                                buf.resize(65536, Complex32::new(0.0, 0.0));
                             }
 
                             let mut put_back = true;
@@ -322,7 +349,8 @@ impl SdrSource for UsrpSource {
                         channel_switches += 1;
                     }
                     Ok(())
-                })() {
+                };
+                if let Err(e) = hop_result {
                     tracing::error!("[usrp] Capture thread failed: {:?}", e);
                 }
             }));
@@ -373,4 +401,74 @@ pub fn query_max_rx_rate(usrp_args: &str) -> Result<f64, SdrError> {
         ));
     }
     Ok(max_rate)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_source_config_rejects_empty_channels() {
+        let err = validate_source_config(0, 2_000_000.0).unwrap_err();
+        assert!(matches!(err, SdrError::BadConfig(_)));
+    }
+
+    #[test]
+    fn validate_source_config_rejects_non_positive_sample_rate() {
+        assert!(validate_source_config(1, 0.0).is_err());
+        assert!(validate_source_config(1, -1.0).is_err());
+    }
+
+    #[test]
+    fn validate_source_config_accepts_sane_input() {
+        assert!(validate_source_config(4, 2_000_000.0).is_ok());
+    }
+
+    #[test]
+    fn select_master_clock_prefers_4x_within_ceiling() {
+        // 10 MSPS * 4 = 40 MHz, under the 61.44 MHz ceiling.
+        let (clock, decimation) = select_master_clock(10_000_000.0);
+        assert_eq!(decimation, 4);
+        assert!((clock - 40_000_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn select_master_clock_falls_back_to_2x() {
+        // 20 MSPS * 4 = 80 MHz (over ceiling); * 2 = 40 MHz (under).
+        let (clock, decimation) = select_master_clock(20_000_000.0);
+        assert_eq!(decimation, 2);
+        assert!((clock - 40_000_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn select_master_clock_falls_back_to_1x_at_the_ceiling() {
+        // 61.44 MSPS: neither *4 nor *2 fit, so no decimation.
+        let (clock, decimation) = select_master_clock(61.44e6);
+        assert_eq!(decimation, 1);
+        assert!((clock - 61.44e6).abs() < 1.0);
+    }
+
+    #[test]
+    fn recycled_buffer_resize_matches_pooled_iq_buffer_drop_semantics() {
+        // `PooledIqBuffer::drop` (orecchiette-sdr-source-rs) does
+        // `vec.clear()` before recycling — len 0, capacity retained.
+        // The capture loop's `buf.resize(65536, ..)` must restore a
+        // full-length buffer without reallocating.
+        let mut cleared = Vec::with_capacity(65536);
+        cleared.resize(65536, Complex32::new(1.0, 1.0));
+        cleared.clear();
+        let cap_before = cleared.capacity();
+
+        cleared.resize(65536, Complex32::new(0.0, 0.0));
+        assert_eq!(cleared.len(), 65536);
+        assert_eq!(cleared.capacity(), cap_before, "resize must not reallocate");
+        assert_eq!(cleared[0], Complex32::new(0.0, 0.0));
+
+        // A buffer put back directly at full length (the no-packet-sent
+        // path) is already len 65536 — resize must be a no-op that
+        // preserves its (stale but initialized) contents.
+        let mut full = vec![Complex32::new(3.0, 4.0); 65536];
+        full.resize(65536, Complex32::new(0.0, 0.0));
+        assert_eq!(full[0], Complex32::new(3.0, 4.0));
+    }
 }

@@ -70,9 +70,22 @@ for packet in handle.receiver.iter() {
 - **MSRV:** This crate does not maintain an explicit Minimum Supported Rust Version (MSRV) policy and tracks the latest `stable` compiler.
 - **Semver:** This crate follows semantic versioning. While in `0.x.y`, breaking API changes will result in a minor version bump (e.g. `0.1.x` to `0.2.0`).
 
+## Errors
+
+`start()` validates `SourceConfig` — a non-empty `channels_hz` and a positive
+`sample_rate_hz` — before opening the USRP, so a bad config returns
+`SdrError::BadConfig` without ever touching the device. Once streaming, if
+every channel fails to tune/stream for 10 consecutive sweeps (~5+ seconds of
+an unresponsive device), the capture thread gives up rather than retrying
+forever; `SdrHandle::wait()` returns once that happens.
+
 ## Testing & Contributing
 
-Please see [CONTRIBUTING.md](CONTRIBUTING.md) for detailed instructions on running the test suite and formatting your code before submitting a Pull Request.
+7 unit tests cover config validation, master-clock/decimation selection
+across the 4×/2×/1× thresholds, and the pooled-buffer resize semantics used
+by the capture loop. Please see [CONTRIBUTING.md](CONTRIBUTING.md) for
+detailed instructions on running the test suite and formatting your code
+before submitting a Pull Request.
 
 ## Documentation
 

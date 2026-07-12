@@ -44,3 +44,22 @@ Operating at high sample rates (e.g., 50 MSPS) over USB 3.0 risks saturating the
 
 ### Hardware Overrun Flags
 When `streamer.receive()` returns `ReceiveErrorKind::Overflow`, the backend sets `IqPacket::overrun = true`. This metadata allows the downstream worker pool to gracefully discard corrupted DSP frames.
+
+## 5. Configuration Validation and Failure Handling
+
+- **Validate before opening hardware.** `validate_source_config()` rejects an
+  empty `channels_hz` or a non-positive `sample_rate_hz` before `start()`
+  calls `uhd::Usrp::find`/`open`/`set_rx_sample_rate` — a bad config fails
+  fast without ever touching the device.
+- **Bounded retry on a dead device.** If every channel in a sweep fails to
+  tune/stream, the hop loop backs off 500ms and retries. After
+  `MAX_CONSECUTIVE_SWEEP_FAILURES` (10) consecutive failed sweeps — meaning
+  the device has been unresponsive for at least ~5 seconds — the capture
+  thread gives up and exits instead of retrying forever, so `SdrHandle::wait()`
+  eventually returns for a USRP that's been unplugged or wedged.
+- **Buffer recycling.** Pooled IQ buffers are resized (not `unsafe`ly
+  `set_len`'d) back to 65,536 samples before each `receive()` call. Buffers
+  come back from the pool in two states — freshly `clear()`'d (len 0, via
+  `PooledIqBuffer::drop`) or still at full length (the no-packet-sent
+  put-back path) — and `Vec::resize` handles both without reallocating,
+  since capacity always already covers 65,536.
