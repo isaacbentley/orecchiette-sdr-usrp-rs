@@ -206,7 +206,9 @@ impl SdrSource for UsrpSource {
                                 );
                                 break 'outer;
                             }
-                            tracing::warn!("[usrp] All channels failed to tune consecutively. Sleeping for 500ms before retrying.");
+                            tracing::warn!(
+                                "[usrp] All channels failed to tune consecutively. Sleeping for 500ms before retrying."
+                            );
                             thread::sleep(Duration::from_millis(500));
                             consecutive_failures = 0;
                         }
@@ -214,8 +216,14 @@ impl SdrSource for UsrpSource {
                         let current_freq_hz = channels_hz[channel_idx];
                         let freq_key = freq_key_khz(current_freq_hz);
 
-                        if let Err(e) = usrp.set_rx_frequency(&TuneRequest::with_frequency(current_freq_hz), 0) {
-                            tracing::warn!("[usrp] Failed to set frequency to {} Hz: {:?}. Skipping channel.", current_freq_hz, e);
+                        if let Err(e) =
+                            usrp.set_rx_frequency(&TuneRequest::with_frequency(current_freq_hz), 0)
+                        {
+                            tracing::warn!(
+                                "[usrp] Failed to set frequency to {} Hz: {:?}. Skipping channel.",
+                                current_freq_hz,
+                                e
+                            );
                             consecutive_failures += 1;
                             channel_idx = (channel_idx + 1) % num_channels;
                             continue;
@@ -224,7 +232,11 @@ impl SdrSource for UsrpSource {
                         let mut rx_stream = match usrp.get_rx_stream(&stream_args) {
                             Ok(s) => s,
                             Err(e) => {
-                                tracing::warn!("[usrp] Failed to get RX stream for {} Hz: {:?}. Skipping channel.", current_freq_hz, e);
+                                tracing::warn!(
+                                    "[usrp] Failed to get RX stream for {} Hz: {:?}. Skipping channel.",
+                                    current_freq_hz,
+                                    e
+                                );
                                 consecutive_failures += 1;
                                 channel_idx = (channel_idx + 1) % num_channels;
                                 continue;
@@ -235,7 +247,11 @@ impl SdrSource for UsrpSource {
                             command_type: StreamCommandType::StartContinuous,
                             time: StreamTime::Now,
                         }) {
-                            tracing::warn!("[usrp] Failed to send start command for {} Hz: {:?}. Skipping channel.", current_freq_hz, e);
+                            tracing::warn!(
+                                "[usrp] Failed to send start command for {} Hz: {:?}. Skipping channel.",
+                                current_freq_hz,
+                                e
+                            );
                             consecutive_failures += 1;
                             channel_idx = (channel_idx + 1) % num_channels;
                             continue;
@@ -319,7 +335,11 @@ impl SdrSource for UsrpSource {
                                     }
                                 }
                                 Err(e) => {
-                                    tracing::warn!("[usrp] Receive error on frequency {} Hz: {:?}", current_freq_hz, e);
+                                    tracing::warn!(
+                                        "[usrp] Receive error on frequency {} Hz: {:?}",
+                                        current_freq_hz,
+                                        e
+                                    );
                                 }
                             }
 
