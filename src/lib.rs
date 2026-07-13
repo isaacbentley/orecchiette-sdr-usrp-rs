@@ -272,10 +272,22 @@ impl SdrSource for UsrpSource {
                                 break 'outer;
                             }
                             let now_loop = Instant::now();
-                            let latest_signal = advice_thread.latest_signal_at(freq_key);
-                            let deadline = dwell_controller.deadline(dwell_start, latest_signal);
-                            if now_loop >= deadline {
-                                break;
+                            // With a single channel there is nowhere to hop, so
+                            // never end the dwell on the deadline — stream
+                            // continuously. Otherwise a single-channel caller
+                            // with a short `dwell_min` (e.g. a wideband
+                            // channelizer) would drop and recreate the RX
+                            // streamer every dwell period, punching periodic gaps
+                            // into an otherwise continuous stream. The dwell
+                            // deadline only gates hopping, which needs
+                            // `num_channels > 1`.
+                            if num_channels > 1 {
+                                let latest_signal = advice_thread.latest_signal_at(freq_key);
+                                let deadline =
+                                    dwell_controller.deadline(dwell_start, latest_signal);
+                                if now_loop >= deadline {
+                                    break;
+                                }
                             }
 
                             // Borrow an empty buffer from the pool (or allocate if heavily backed up)
