@@ -213,7 +213,12 @@ impl SdrSource for UsrpSource {
                             consecutive_failures = 0;
                         }
 
-                        let current_freq_hz = channels_hz[channel_idx];
+                        // A live `/video` viewer wants a specific channel: park there and
+                        // hold, bypassing the hop list entirely, until the override changes
+                        // or clears. `channel_idx` isn't touched while parked, so hopping
+                        // resumes exactly where it left off once the viewer disconnects.
+                        let override_freq = advice_thread.channel_override();
+                        let current_freq_hz = override_freq.unwrap_or(channels_hz[channel_idx]);
                         let freq_key = freq_key_khz(current_freq_hz);
 
                         if let Err(e) =
@@ -272,16 +277,33 @@ impl SdrSource for UsrpSource {
                                 break 'outer;
                             }
                             let now_loop = Instant::now();
-                            // With a single channel there is nowhere to hop, so
-                            // never end the dwell on the deadline — stream
-                            // continuously. Otherwise a single-channel caller
-                            // with a short `dwell_min` (e.g. a wideband
-                            // channelizer) would drop and recreate the RX
-                            // streamer every dwell period, punching periodic gaps
-                            // into an otherwise continuous stream. The dwell
-                            // deadline only gates hopping, which needs
-                            // `num_channels > 1`.
-                            if num_channels > 1 {
+                            let still_overridden =
+                                advice_thread.channel_override() == Some(current_freq_hz);
+                            if override_freq.is_some() {
+                                // Parked here for live view: hold regardless of the dwell
+                                // deadline, same as the single-channel case below, but break
+                                // out the moment the viewer's channel changes or they
+                                // disconnect (`channel_override()` now differs) so the outer
+                                // loop can retune or resume hopping.
+                                if !still_overridden {
+                                    break;
+                                }
+                            } else if still_overridden {
+                                // A viewer just requested this exact channel while we were
+                                // still mid-hop-dwell here — break out now (rather than
+                                // waiting for the normal dwell deadline) so the next outer
+                                // iteration parks on it promptly.
+                                break;
+                            } else if num_channels > 1 {
+                                // With a single channel there is nowhere to hop, so
+                                // never end the dwell on the deadline — stream
+                                // continuously. Otherwise a single-channel caller
+                                // with a short `dwell_min` (e.g. a wideband
+                                // channelizer) would drop and recreate the RX
+                                // streamer every dwell period, punching periodic gaps
+                                // into an otherwise continuous stream. The dwell
+                                // deadline only gates hopping, which needs
+                                // `num_channels > 1`.
                                 let latest_signal = advice_thread.latest_signal_at(freq_key);
                                 let deadline =
                                     dwell_controller.deadline(dwell_start, latest_signal);
@@ -377,8 +399,13 @@ impl SdrSource for UsrpSource {
                         });
                         drop(rx_stream);
 
-                        channel_idx = (channel_idx + 1) % num_channels;
-                        channel_switches += 1;
+                        // Parking on a live-view override isn't a hop step — don't advance
+                        // past it, so hopping resumes at the same channel it would have
+                        // once the override clears.
+                        if override_freq.is_none() {
+                            channel_idx = (channel_idx + 1) % num_channels;
+                            channel_switches += 1;
+                        }
                     }
                     Ok(())
                 };
