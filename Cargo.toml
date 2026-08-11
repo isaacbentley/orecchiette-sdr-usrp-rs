@@ -11,7 +11,11 @@ categories = ["hardware-support", "api-bindings"]
 
 [dependencies]
 orecchiette-sdr-source-rs = "0.1.3"
-uhd = "0.3.0"
+# TODO(dependabot): uhd-sys 0.1.3 (pulled by uhd 0.3.0+) pins bindgen 0.55.1 which brings in vulnerable 
+# versions of atty and shlex via build-dependencies. These alerts are currently dismissed on GitHub 
+# as tolerable risk since they don't ship in the binary. If samcrow/uhd-rust ever bumps bindgen, 
+# we should remove this exception.
+uhd = "0.4.0"
 crossbeam = "0.8"
 num-complex = "0.4"
 anyhow = "1.0"

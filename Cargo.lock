@@ -536,9 +536,9 @@ dependencies = [
 
 [[package]]
 name = "uhd"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "70d2c98c51466ce4e9a41b73fc65f1943319918f56b74d1bfe48afcf7db89f64"
+checksum = "0ff3cb1dff789220e58f8054464f6b39aa9d911b6b8920e8e8a70c1af54310b9"
 dependencies = [
  "anyhow",
  "libc",
