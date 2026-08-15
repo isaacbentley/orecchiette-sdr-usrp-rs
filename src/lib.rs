@@ -54,6 +54,26 @@ fn should_abandon_stream(consecutive_receive_errors: u32) -> bool {
     consecutive_receive_errors >= MAX_CONSECUTIVE_RECEIVE_ERRORS
 }
 
+/// How many channels may be abandoned back-to-back without a single sample
+/// before the device itself is written off.
+///
+/// This is a *separate* ladder from `consecutive_failures`, which counts
+/// channels that failed to **tune**. A tune that succeeds resets that counter,
+/// so a device which tunes cleanly but never streams — unplugged mid-run, or
+/// wedged in a state where the RX stream opens and then yields nothing —
+/// increments it once per channel and immediately zeroes it on the next
+/// successful tune. The bound is then unreachable and the loop retries
+/// forever. Only actual samples clear this one.
+const MAX_CONSECUTIVE_STREAMLESS_CHANNELS: u32 = 8;
+
+/// Should the device be written off after this many channels tuned without a
+/// single sample arriving?
+///
+/// Extracted so the decision is testable without a USRP attached.
+fn should_abandon_device(consecutive_streamless_channels: u32) -> bool {
+    consecutive_streamless_channels >= MAX_CONSECUTIVE_STREAMLESS_CHANNELS
+}
+
 /// Builder for a USRP source. Wrap in `Box::new(...)` and call
 /// [`SdrSource::start`] from the orchestrator.
 pub struct UsrpSource {
@@ -217,11 +237,21 @@ impl SdrSource for UsrpSource {
                     let mut channel_idx = 0;
                     let mut consecutive_failures = 0;
                     let mut consecutive_sweep_failures = 0;
+                    let mut consecutive_streamless_channels = 0u32;
                     let num_channels = channels_hz.len();
 
                     'outer: loop {
                         if stop_flag_thread.load(Ordering::SeqCst) {
                             break;
+                        }
+
+                        if should_abandon_device(consecutive_streamless_channels) {
+                            tracing::error!(
+                                "[usrp] {} channels tuned without receiving a single sample. \
+                                 Giving up — is the USRP still connected?",
+                                consecutive_streamless_channels
+                            );
+                            break 'outer;
                         }
 
                         if consecutive_failures >= num_channels {
@@ -365,6 +395,9 @@ impl SdrSource for UsrpSource {
                                 Ok(meta) => {
                                     let n = meta.samples().min(raw_buffer.as_ref().unwrap().len());
                                     if n > 0 {
+                                        // Samples in hand: the device is alive,
+                                        // so the streamless ladder starts over.
+                                        consecutive_streamless_channels = 0;
                                         let is_overrun = if let Some(err) = meta.last_error() {
                                             err.to_string().contains("Overflow")
                                         } else {
@@ -420,6 +453,12 @@ impl SdrSource for UsrpSource {
                                             let _ = pool_tx.send(buf);
                                         }
                                         consecutive_failures += 1;
+                                        // Counted on its own ladder because the
+                                        // re-tune below succeeds on a device
+                                        // that is present but not streaming,
+                                        // and a successful tune clears
+                                        // `consecutive_failures`.
+                                        consecutive_streamless_channels += 1;
                                         channel_idx = (channel_idx + 1) % num_channels;
                                         break;
                                     }
@@ -622,6 +661,37 @@ mod receive_error_bounding_tests {
         assert!(
             worst_case <= Duration::from_secs(1),
             "abandoning a dead stream should take under a second, not {worst_case:?}"
+        );
+    }
+
+    #[test]
+    fn a_few_streamless_channels_do_not_write_off_the_device() {
+        for n in 0..MAX_CONSECUTIVE_STREAMLESS_CHANNELS {
+            assert!(
+                !should_abandon_device(n),
+                "{n} streamless channels should not write off the device"
+            );
+        }
+    }
+
+    #[test]
+    fn persistently_streamless_channels_write_off_the_device() {
+        assert!(should_abandon_device(MAX_CONSECUTIVE_STREAMLESS_CHANNELS));
+        assert!(should_abandon_device(MAX_CONSECUTIVE_STREAMLESS_CHANNELS + 100));
+    }
+
+    /// The whole point of the second ladder: a device that tunes cleanly but
+    /// never streams must still terminate. Abandoning one stream costs at most
+    /// `MAX_CONSECUTIVE_RECEIVE_ERRORS` backoffs, and the device is written off
+    /// after `MAX_CONSECUTIVE_STREAMLESS_CHANNELS` of those, so the worst case
+    /// is bounded rather than infinite.
+    #[test]
+    fn a_tuning_but_streamless_device_gives_up_in_bounded_time() {
+        let per_channel = RECEIVE_ERROR_BACKOFF * MAX_CONSECUTIVE_RECEIVE_ERRORS;
+        let worst_case = per_channel * MAX_CONSECUTIVE_STREAMLESS_CHANNELS;
+        assert!(
+            worst_case <= Duration::from_secs(10),
+            "a tuning-but-silent USRP should be written off within 10s, not {worst_case:?}"
         );
     }
 }
