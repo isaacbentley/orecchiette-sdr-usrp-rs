@@ -27,6 +27,33 @@ use uhd::{StreamCommand, StreamCommandType, StreamTime, TuneRequest};
 /// spinning silently.
 const MAX_CONSECUTIVE_SWEEP_FAILURES: u32 = 10;
 
+/// Consecutive `receive` errors tolerated before abandoning the RX stream and
+/// letting the outer loop re-tune.
+///
+/// This matters most for the single-channel case, where the dwell deadline is
+/// deliberately never evaluated so the stream runs continuously. Without a
+/// bound, a persistent receive error — the USRP unplugged, a USB fault — turns
+/// that loop into a hot spin: `receive` returns immediately, the arm logs a
+/// warning and loops, forever, at full CPU. The caller sees no error, only
+/// silence, because a stalled source and an idle band look identical from the
+/// outside.
+const MAX_CONSECUTIVE_RECEIVE_ERRORS: u32 = 20;
+
+/// How long to wait after a failed `receive` before trying again.
+///
+/// A timed-out `receive` self-throttles (it waits out its own timeout before
+/// returning), but an errored one returns instantly, so the retry needs its own
+/// pacing or it becomes a busy loop.
+const RECEIVE_ERROR_BACKOFF: Duration = Duration::from_millis(20);
+
+/// Should the RX stream be abandoned after this many consecutive receive
+/// errors?
+///
+/// Extracted so the decision is testable without a USRP attached.
+fn should_abandon_stream(consecutive_receive_errors: u32) -> bool {
+    consecutive_receive_errors >= MAX_CONSECUTIVE_RECEIVE_ERRORS
+}
+
 /// Builder for a USRP source. Wrap in `Box::new(...)` and call
 /// [`SdrSource::start`] from the orchestrator.
 pub struct UsrpSource {
@@ -265,6 +292,7 @@ impl SdrSource for UsrpSource {
                         // Reset consecutive failures on successful tune/start
                         consecutive_failures = 0;
                         consecutive_sweep_failures = 0;
+                        let mut consecutive_receive_errors = 0u32;
 
                         let dwell_start = Instant::now();
                         loop {
@@ -367,13 +395,37 @@ impl SdrSource for UsrpSource {
                                         }
                                         put_back = false;
                                     }
+                                    // Any successful receive — including a
+                                    // timeout with no samples — means the
+                                    // device is still answering.
+                                    consecutive_receive_errors = 0;
                                 }
                                 Err(e) => {
+                                    consecutive_receive_errors += 1;
                                     tracing::warn!(
-                                        "[usrp] Receive error on frequency {} Hz: {:?}",
+                                        "[usrp] Receive error on frequency {} Hz ({} consecutive): {:?}",
                                         current_freq_hz,
+                                        consecutive_receive_errors,
                                         e
                                     );
+                                    if should_abandon_stream(consecutive_receive_errors) {
+                                        tracing::error!(
+                                            "[usrp] {} consecutive receive errors on {} Hz; \
+                                             abandoning this RX stream to re-tune. Is the USRP \
+                                             still connected?",
+                                            consecutive_receive_errors,
+                                            current_freq_hz
+                                        );
+                                        if put_back && let Some(buf) = raw_buffer.take() {
+                                            let _ = pool_tx.send(buf);
+                                        }
+                                        consecutive_failures += 1;
+                                        channel_idx = (channel_idx + 1) % num_channels;
+                                        break;
+                                    }
+                                    // Pace the retry: an errored receive returns
+                                    // instantly, unlike a timed-out one.
+                                    thread::sleep(RECEIVE_ERROR_BACKOFF);
                                 }
                             }
 
@@ -529,5 +581,47 @@ mod tests {
         let mut full = vec![Complex32::new(3.0, 4.0); 65536];
         full.resize(65536, Complex32::new(0.0, 0.0));
         assert_eq!(full[0], Complex32::new(3.0, 4.0));
+    }
+}
+
+#[cfg(test)]
+mod receive_error_bounding_tests {
+    use super::*;
+
+    /// A transient receive error must not abandon a working stream.
+    #[test]
+    fn a_few_errors_do_not_abandon_the_stream() {
+        for n in 0..MAX_CONSECUTIVE_RECEIVE_ERRORS {
+            assert!(
+                !should_abandon_stream(n),
+                "{n} consecutive errors should still be tolerated"
+            );
+        }
+    }
+
+    /// A persistent one must.
+    ///
+    /// The failure this guards is specific to the single-channel case, where
+    /// the dwell deadline is deliberately never evaluated so the stream runs
+    /// continuously (see the `num_channels > 1` guard in the dwell loop). With
+    /// no bound here, a USRP unplugged mid-run left that loop spinning at full
+    /// CPU and logging forever, while the caller saw only silence — a stalled
+    /// source is indistinguishable from a quiet band from the outside.
+    #[test]
+    fn a_persistent_failure_abandons_the_stream() {
+        assert!(should_abandon_stream(MAX_CONSECUTIVE_RECEIVE_ERRORS));
+        assert!(should_abandon_stream(MAX_CONSECUTIVE_RECEIVE_ERRORS + 100));
+    }
+
+    /// The bound has to be reached in a bounded wall-clock time, or "eventually
+    /// gives up" is not a useful property. With the backoff applied per error,
+    /// the stream is abandoned in well under a second.
+    #[test]
+    fn giving_up_takes_a_bounded_and_short_time() {
+        let worst_case = RECEIVE_ERROR_BACKOFF * MAX_CONSECUTIVE_RECEIVE_ERRORS;
+        assert!(
+            worst_case <= Duration::from_secs(1),
+            "abandoning a dead stream should take under a second, not {worst_case:?}"
+        );
     }
 }
